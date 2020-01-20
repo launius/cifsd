@@ -31,6 +31,7 @@
 #include "mgmt/tree_connect.h"
 #include "mgmt/user_session.h"
 #include "mgmt/cifsd_ida.h"
+#include "mgmt/file_notify.h"
 
 bool multi_channel_enable;
 bool encryption_enable = true;
@@ -713,9 +714,7 @@ int setup_async_work(struct cifsd_work *work, void (*fn)(void **), void **arg)
 	work->cancel_argv = arg;
 
 	spin_lock(&conn->request_lock);
-	list_del_init(&work->request_entry);
-	list_add_tail(&work->request_entry,
-		&conn->async_requests);
+	list_add_tail(&work->async_request_entry, &conn->async_requests);
 	spin_unlock(&conn->request_lock);
 
 	return 0;
@@ -5691,35 +5690,50 @@ int smb2_cancel(struct cifsd_work *work)
 	int canceled = 0;
 	struct list_head *command_list;
 
-	cifsd_debug("smb2 cancel called on mid %llu\n", hdr->MessageId);
+	cifsd_debug("smb2 cancel called on mid %llu, async flags 0x%x\n",
+		hdr->MessageId, hdr->Flags);
 
-	if (hdr->Flags & SMB2_FLAGS_ASYNC_COMMAND)
+	if (hdr->Flags & SMB2_FLAGS_ASYNC_COMMAND) {
 		command_list = &conn->async_requests;
-	else
-		command_list = &conn->requests;
 
-	spin_lock(&conn->request_lock);
-	list_for_each(tmp, command_list) {
-		cancel_work = list_entry(tmp, struct cifsd_work,
-				request_entry);
-		chdr = (struct smb2_hdr *)REQUEST_BUF(cancel_work);
-		if (cancel_work->type == ASYNC) {
+		spin_lock(&conn->request_lock);
+		list_for_each(tmp, command_list) {
+			cancel_work = list_entry(tmp, struct cifsd_work,
+					async_request_entry);
+			chdr = (struct smb2_hdr *)REQUEST_BUF(cancel_work);
+
 			if (cancel_work->async_id !=
 					le64_to_cpu(hdr->Id.AsyncId))
 				continue;
+
 			cifsd_debug("smb2 with AsyncId %llu cancelled command = 0x%x\n",
-					hdr->Id.AsyncId, chdr->Command);
-		} else {
+				le64_to_cpu(hdr->Id.AsyncId),
+				le16_to_cpu(chdr->Command));
+			canceled = 1;
+			break;
+		}
+		spin_unlock(&conn->request_lock);
+	} else {
+		command_list = &conn->requests;
+
+		spin_lock(&conn->request_lock);
+		list_for_each(tmp, command_list) {
+			cancel_work = list_entry(tmp, struct cifsd_work,
+					request_entry);
+			chdr = (struct smb2_hdr *)REQUEST_BUF(cancel_work);
+
 			if (chdr->MessageId != hdr->MessageId ||
 				cancel_work == work)
 				continue;
+
 			cifsd_debug("smb2 with mid %llu cancelled command = 0x%x\n",
-				hdr->MessageId, chdr->Command);
+				le64_to_cpu(hdr->MessageId),
+				le16_to_cpu(chdr->Command));
+			canceled = 1;
+			break;
 		}
-		canceled = 1;
-		break;
+		spin_unlock(&conn->request_lock);
 	}
-	spin_unlock(&conn->request_lock);
 
 	if (canceled) {
 		cancel_work->state = WORK_STATE_CANCELLED;
@@ -6908,6 +6922,47 @@ err_out:
 	return 0;
 }
 
+void smb2_notify_cancel(void **argv)
+{
+	unsigned long *async_id = *(unsigned long **)argv;
+
+	cifsd_debug("cancel the monitoring file system events. async_id = %ld\n", *async_id);
+
+	cifsd_file_notify_cancel(async_id);
+}
+
+static size_t build_notify_info(unsigned char *outbuf, unsigned char *inbuf, size_t sz)
+{
+	int offset = 0;
+	unsigned char *in, *out;
+	struct cifsd_file_notify_info *src;
+	struct smb2_file_notify_info *dest, *prev = NULL;
+
+	in = inbuf;
+	out = outbuf;
+
+	while (in < inbuf + sz)
+	{
+		src = (struct cifsd_file_notify_info *)in;
+		dest = (struct smb2_file_notify_info *)out;
+
+		if (prev)
+			prev->NextEntryOffset = cpu_to_le32(offset);
+
+		dest->NextEntryOffset = 0x00;
+		dest->Action = cpu_to_le32(src->action);
+		dest->FileNameLength = cpu_to_le32(src->filename_len);
+		strncpy(dest->FileName, src->filename, dest->FileNameLength);
+
+		in += offsetof(struct cifsd_file_notify_info, filename) + src->filename_len;
+		offset = offsetof(struct smb2_file_notify_info, FileName) + dest->FileNameLength;
+		out += offset;
+		prev = dest;
+	}
+	
+	return out - outbuf;
+}
+
 /**
  * smb2_notify() - handler for smb2 notify request
  * @cifsd_work:   smb work containing notify command buffer
@@ -6917,11 +6972,15 @@ err_out:
 int smb2_notify(struct cifsd_work *cifsd_work)
 {
 	struct smb2_notify_req *req;
-	struct smb2_notify_rsp *rsp, *rsp_org;
+	struct smb2_notify_rsp *rsp;
+	struct cifsd_file *fp;
+	struct cifsd_file_notify_status *result;
+	bool wt;
+	unsigned long long *p;
+	size_t len;
 
 	req = (struct smb2_notify_req *)REQUEST_BUF(cifsd_work);
 	rsp = (struct smb2_notify_rsp *)RESPONSE_BUF(cifsd_work);
-	rsp_org = rsp;
 
 	if (cifsd_work->next_smb2_rcv_hdr_off) {
 	req = (struct smb2_notify_req *)((char *)req +
@@ -6937,6 +6996,8 @@ int smb2_notify(struct cifsd_work *cifsd_work)
 		return 0;
 	}
 
+#define CHANGE_NOTIFY_ENABLE
+#ifndef CHANGE_NOTIFY_ENABLE
 	/*
 	 * Win7 send peoridically query_dir command if cifsd just response
 	 * with NT_STATUS_NOT_IMPLEMENTED status. If SMB2_WATCH_TREE flags
@@ -6948,8 +7009,56 @@ int smb2_notify(struct cifsd_work *cifsd_work)
 		cifsd_work->send_no_response = 1;
 	} else {
 		smb2_set_err_rsp(cifsd_work);
-		rsp->hdr.Status = NT_STATUS_NOT_IMPLEMENTED;
+		rsp->hdr.Status = NT_STATUS_PENDING;
 	}
+#else
+	cifsd_debug("monitoring file system events with inotify. Notify Flags: 0x%x\n", req->Flags);
+
+	//TODO: consider to move into file_notify
+	fp = get_fp(cifsd_work, le64_to_cpu(req->VolatileFileId), le64_to_cpu(req->PersistentFileId));
+	if (!fp) {
+		cifsd_err("failed to get file info. file id 0x%llx\n", req->VolatileFileId);
+		//TODO: check if needed to send a error response
+		return -ENOENT;
+	}
+
+	p = &cifsd_work->async_id;
+	if (setup_async_work(cifsd_work, smb2_notify_cancel, (void **)&p)) {
+		cifsd_err("failed to setup asynchronous work.\n");
+		return -ENOMEM;
+	}
+
+	smb2_send_interim_resp(cifsd_work, NT_STATUS_PENDING);
+	cifsd_work->send_no_response = 1;
+
+	wt = le16_to_cpu(req->Flags) & SMB2_WATCH_TREE;
+	result = cifsd_file_notify_wait(cifsd_work->async_id, fp->filename, wt, req->CompletionFilter);
+	if (!result) {
+		cifsd_err("failed to monitor file system events with inotify. filename (%s)\n", fp->filename);
+		return -ENOMEM;
+	}
+
+	if (result->ret) {
+		rsp->hdr.Status = NT_STATUS_CANCELLED;
+		smb2_set_err_rsp(cifsd_work);
+	} else {
+		rsp->hdr.smb2_buf_length = cpu_to_be32(SMB2_HEADER_STRUCTURE_SIZE);
+		rsp->hdr.Status = NT_STATUS_OK;
+
+		len = build_notify_info(rsp->Buffer, result->outbuf, result->outbuf_sz);
+		inc_rfc1001_len(rsp, len);
+		
+		rsp->StructureSize = cpu_to_le16(9);
+		rsp->OutputBufferOffset = cpu_to_le16(72);
+		rsp->OutputBufferLength = cpu_to_le32(len);
+		inc_rfc1001_len(rsp, 8);
+	}
+
+	cifsd_free(result);
+	cifsd_work->send_no_response = 0;
+
+	cifsd_debug("notify response status 0x%x, info length %u\n", rsp->hdr.Status, rsp->OutputBufferLength);
+#endif
 
 	return 0;
 }

@@ -15,6 +15,7 @@ cifsd_ipc_login_request(const char *account);
 struct cifsd_session;
 struct cifsd_share_config;
 struct cifsd_tree_connect;
+struct cifsd_file_notify;
 struct sockaddr;
 
 struct cifsd_tree_connect_response *
@@ -25,6 +26,8 @@ cifsd_ipc_tree_connect_request(struct cifsd_session *sess,
 
 int cifsd_ipc_tree_disconnect_request(unsigned long long session_id,
 				      unsigned long long connect_id);
+struct cifsd_notify_response *cifsd_ipc_notify_request(struct cifsd_file_notify *item);
+int cifsd_ipc_notify_cancel_request(unsigned int hdl);
 int cifsd_ipc_logout_request(const char *account);
 int cifsd_ipc_heartbeat_request(void);
 

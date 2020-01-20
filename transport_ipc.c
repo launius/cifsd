@@ -23,6 +23,7 @@
 #include "mgmt/user_session.h"
 #include "mgmt/tree_connect.h"
 #include "mgmt/cifsd_ida.h"
+#include "mgmt/file_notify.h"
 
 /* @FIXME fix this code */
 extern int get_protocol_idx(char *str);
@@ -109,6 +110,15 @@ static const struct nla_policy cifsd_nl_policy[CIFSD_EVENT_MAX] = {
 	[CIFSD_EVENT_TREE_DISCONNECT_REQUEST] = {
 		.len = sizeof(struct cifsd_tree_disconnect_request),
 	},
+	[CIFSD_EVENT_NOTIFY_REQUEST] = {
+		.len = sizeof(struct cifsd_notify_request),
+	},
+	[CIFSD_EVENT_NOTIFY_RESPONSE] = {
+		.len = sizeof(struct cifsd_notify_response),
+	},
+	[CIFSD_EVENT_NOTIFY_CANCEL_REQUEST] = {
+		.len = sizeof(struct cifsd_notify_cancel_request),
+	},
 	[CIFSD_EVENT_LOGOUT_REQUEST] = {
 		.len = sizeof(struct cifsd_logout_request),
 	},
@@ -171,6 +181,21 @@ static const struct genl_ops cifsd_genl_ops[] = {
 	},
 	{
 		.cmd	= CIFSD_EVENT_TREE_DISCONNECT_REQUEST,
+		.doit	= handle_unsupported_event,
+		.policy = cifsd_nl_policy,
+	},
+	{
+		.cmd	= CIFSD_EVENT_NOTIFY_REQUEST,
+		.doit	= handle_unsupported_event,
+		.policy = cifsd_nl_policy,
+	},
+	{
+		.cmd	= CIFSD_EVENT_NOTIFY_RESPONSE,
+		.doit	= handle_generic_event,
+		.policy = cifsd_nl_policy,
+	},
+	{
+		.cmd	= CIFSD_EVENT_NOTIFY_CANCEL_REQUEST,
 		.doit	= handle_unsupported_event,
 		.policy = cifsd_nl_policy,
 	},
@@ -408,7 +433,7 @@ out:
 }
 
 static void *ipc_msg_send_request(struct cifsd_ipc_msg *msg,
-				  unsigned int handle)
+				  unsigned int handle, bool timeout)
 {
 	struct ipc_msg_table_entry entry;
 	int ret;
@@ -429,9 +454,15 @@ static void *ipc_msg_send_request(struct cifsd_ipc_msg *msg,
 	if (ret)
 		goto out;
 
-	ret = wait_event_interruptible_timeout(entry.wait,
-					       entry.response != NULL,
-					       IPC_WAIT_TIMEOUT);
+	if (timeout)
+		ret = wait_event_interruptible_timeout(entry.wait,
+						       entry.response != NULL,
+						       IPC_WAIT_TIMEOUT);
+	else {
+		ret = wait_event_interruptible(entry.wait,
+						       entry.response != NULL);
+	}
+
 out:
 	down_write(&ipc_msg_table_lock);
 	hash_del(&entry.ipc_table_hlist);
@@ -486,7 +517,7 @@ struct cifsd_login_response *cifsd_ipc_login_request(const char *account)
 	req->handle = cifds_acquire_id(ida);
 	strncpy(req->account, account, sizeof(req->account) - 1);
 
-	resp = ipc_msg_send_request(msg, req->handle);
+	resp = ipc_msg_send_request(msg, req->handle, true);
 	ipc_msg_handle_free(req->handle);
 	ipc_msg_free(msg);
 	return resp;
@@ -522,7 +553,7 @@ cifsd_ipc_tree_connect_request(struct cifsd_session *sess,
 	if (test_session_flag(sess, CIFDS_SESSION_FLAG_SMB2))
 		req->flags |= CIFSD_TREE_CONN_FLAG_REQUEST_SMB2;
 
-	resp = ipc_msg_send_request(msg, req->handle);
+	resp = ipc_msg_send_request(msg, req->handle, true);
 	ipc_msg_handle_free(req->handle);
 	ipc_msg_free(msg);
 	return resp;
@@ -543,6 +574,51 @@ int cifsd_ipc_tree_disconnect_request(unsigned long long session_id,
 	req = CIFSD_IPC_MSG_PAYLOAD(msg);
 	req->session_id = session_id;
 	req->connect_id = connect_id;
+
+	ret = ipc_msg_send(msg);
+	ipc_msg_free(msg);
+	return ret;
+}
+
+struct cifsd_notify_response *cifsd_ipc_notify_request(struct cifsd_file_notify *noti)
+{
+	struct cifsd_ipc_msg *msg;
+	struct cifsd_notify_request *req;
+	struct cifsd_notify_response *resp;
+	unsigned int len = strlen(noti->path);
+
+	msg = ipc_msg_alloc(sizeof(struct cifsd_notify_request) + len + 1);
+	if (!msg)
+		return NULL;
+
+	msg->type = CIFSD_EVENT_NOTIFY_REQUEST;
+	req = CIFSD_IPC_MSG_PAYLOAD(msg);
+
+	req->handle = noti->handle = cifds_acquire_id(ida);
+	req->is_dir = noti->is_dir;
+	req->path_len = len;
+	strncpy(req->path, noti->path, len);
+	resp = ipc_msg_send_request(msg, req->handle, false);
+
+	ipc_msg_handle_free(req->handle);
+	ipc_msg_free(msg);
+
+	return resp;
+}
+
+int cifsd_ipc_notify_cancel_request(unsigned int hdl)
+{
+	struct cifsd_ipc_msg *msg;
+	struct cifsd_notify_cancel_request *req;
+	int ret;
+
+	msg = ipc_msg_alloc(sizeof(struct cifsd_notify_cancel_request));
+	if (!msg)
+		return -ENOMEM;
+
+	msg->type = CIFSD_EVENT_NOTIFY_CANCEL_REQUEST;
+	req = CIFSD_IPC_MSG_PAYLOAD(msg);
+	req->handle = hdl;
 
 	ret = ipc_msg_send(msg);
 	ipc_msg_free(msg);
@@ -599,7 +675,7 @@ cifsd_ipc_share_config_request(const char *name)
 	req->handle = cifds_acquire_id(ida);
 	strncpy(req->share_name, name, sizeof(req->share_name) - 1);
 
-	resp = ipc_msg_send_request(msg, req->handle);
+	resp = ipc_msg_send_request(msg, req->handle, true);
 	ipc_msg_handle_free(req->handle);
 	ipc_msg_free(msg);
 	return resp;
@@ -623,7 +699,7 @@ struct cifsd_rpc_command *cifsd_rpc_open(struct cifsd_session *sess,
 	req->flags |= CIFSD_RPC_OPEN_METHOD;
 	req->payload_sz = 0;
 
-	resp = ipc_msg_send_request(msg, req->handle);
+	resp = ipc_msg_send_request(msg, req->handle, true);
 	ipc_msg_free(msg);
 	return resp;
 }
@@ -646,7 +722,7 @@ struct cifsd_rpc_command *cifsd_rpc_close(struct cifsd_session *sess,
 	req->flags |= CIFSD_RPC_CLOSE_METHOD;
 	req->payload_sz = 0;
 
-	resp = ipc_msg_send_request(msg, req->handle);
+	resp = ipc_msg_send_request(msg, req->handle, true);
 	ipc_msg_free(msg);
 	return resp;
 }
@@ -673,7 +749,7 @@ struct cifsd_rpc_command *cifsd_rpc_write(struct cifsd_session *sess,
 	req->payload_sz = payload_sz;
 	memcpy(req->payload, payload, payload_sz);
 
-	resp = ipc_msg_send_request(msg, req->handle);
+	resp = ipc_msg_send_request(msg, req->handle, true);
 	ipc_msg_free(msg);
 	return resp;
 }
@@ -697,7 +773,7 @@ struct cifsd_rpc_command *cifsd_rpc_read(struct cifsd_session *sess,
 	req->flags |= CIFSD_RPC_READ_METHOD;
 	req->payload_sz = 0;
 
-	resp = ipc_msg_send_request(msg, req->handle);
+	resp = ipc_msg_send_request(msg, req->handle, true);
 	ipc_msg_free(msg);
 	return resp;
 }
@@ -724,7 +800,7 @@ struct cifsd_rpc_command *cifsd_rpc_ioctl(struct cifsd_session *sess,
 	req->payload_sz = payload_sz;
 	memcpy(req->payload, payload, payload_sz);
 
-	resp = ipc_msg_send_request(msg, req->handle);
+	resp = ipc_msg_send_request(msg, req->handle, true);
 	ipc_msg_free(msg);
 	return resp;
 }
@@ -749,7 +825,7 @@ struct cifsd_rpc_command *cifsd_rpc_rap(struct cifsd_session *sess,
 	req->payload_sz = payload_sz;
 	memcpy(req->payload, payload, payload_sz);
 
-	resp = ipc_msg_send_request(msg, req->handle);
+	resp = ipc_msg_send_request(msg, req->handle, true);
 	ipc_msg_handle_free(req->handle);
 	ipc_msg_free(msg);
 	return resp;

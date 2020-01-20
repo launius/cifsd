@@ -98,6 +98,24 @@ struct cifsd_tree_disconnect_request {
 	__u64	connect_id;
 } __align;
 
+struct cifsd_notify_request {
+	__u32	handle;
+	__u8	is_dir;
+	__u16	path_len;
+	__s8	path[0];
+} __align;
+
+struct cifsd_notify_response {
+	__u32	handle;
+	__u16	status;
+	__u16	outbuf_sz;
+	__u8	outbuf[0];
+} __align;
+
+struct cifsd_notify_cancel_request {
+	__u32	handle;
+} __align;
+
 struct cifsd_logout_request {
 	__s8	account[CIFSD_REQ_MAX_ACCOUNT_NAME_SZ];
 } __align;
@@ -134,9 +152,14 @@ enum cifsd_event {
 
 	CIFSD_EVENT_TREE_DISCONNECT_REQUEST	= 10,
 
+	CIFSD_EVENT_NOTIFY_REQUEST,
+	CIFSD_EVENT_NOTIFY_RESPONSE,
+
+	CIFSD_EVENT_NOTIFY_CANCEL_REQUEST,
+
 	CIFSD_EVENT_LOGOUT_REQUEST,
 
-	CIFSD_EVENT_RPC_REQUEST,
+	CIFSD_EVENT_RPC_REQUEST			= 15,
 	CIFSD_EVENT_RPC_RESPONSE,
 
 	CIFSD_EVENT_MAX
@@ -153,6 +176,18 @@ enum CIFSD_TREE_CONN_STATUS {
 	CIFSD_TREE_CONN_STATUS_TOO_MANY_CONNS,
 	CIFSD_TREE_CONN_STATUS_TOO_MANY_SESSIONS,
 	CIFSD_TREE_CONN_STATUS_ERROR,
+};
+
+enum CIFSD_NOTIFY_STATUS {
+	CIFSD_NOTIFY_STATUS_OK = 0,
+	CIFSD_NOTIFY_STATUS_INVALID_PARAMETER,
+	CIFSD_NOTIFY_STATUS_LIMIT_EXCEEDED,
+	CIFSD_NOTIFY_STATUS_NO_MEMORY,
+	CIFSD_NOTIFY_STATUS_ACCESS_VIOLATION,
+	CIFSD_NOTIFY_STATUS_ENTRYPOINT_NOT_FOUND = 5,
+	CIFSD_NOTIFY_STATUS_BAD_DESCRIPTOR,
+	CIFSD_NOTIFY_STATUS_INTERRUPTED,
+	CIFSD_NOTIFY_STATUS_ERROR
 };
 
 /*

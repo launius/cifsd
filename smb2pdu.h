@@ -853,21 +853,6 @@ struct copychunk_ioctl_rsp {
 	__le32 TotalBytesWritten;
 } __packed;
 
-/* Completion Filter flags for Notify */
-#define FILE_NOTIFY_CHANGE_FILE_NAME	0x00000001
-#define FILE_NOTIFY_CHANGE_DIR_NAME	0x00000002
-#define FILE_NOTIFY_CHANGE_NAME		0x00000003
-#define FILE_NOTIFY_CHANGE_ATTRIBUTES	0x00000004
-#define FILE_NOTIFY_CHANGE_SIZE		0x00000008
-#define FILE_NOTIFY_CHANGE_LAST_WRITE	0x00000010
-#define FILE_NOTIFY_CHANGE_LAST_ACCESS	0x00000020
-#define FILE_NOTIFY_CHANGE_CREATION	0x00000040
-#define FILE_NOTIFY_CHANGE_EA		0x00000080
-#define FILE_NOTIFY_CHANGE_SECURITY	0x00000100
-#define FILE_NOTIFY_CHANGE_STREAM_NAME	0x00000200
-#define FILE_NOTIFY_CHANGE_STREAM_SIZE	0x00000400
-#define FILE_NOTIFY_CHANGE_STREAM_WRITE	0x00000800
-
 /* Flags */
 #define SMB2_WATCH_TREE	0x0001
 
@@ -878,7 +863,7 @@ struct smb2_notify_req {
 	__le32 OutputBufferLength;
 	__u64 PersistentFileId; /* opaque endianness */
 	__u64 VolatileFileId; /* opaque endianness */
-	__u32 CompletionFileter;
+	__u32 CompletionFilter;
 	__u32 Reserved;
 } __packed;
 
@@ -888,6 +873,13 @@ struct smb2_notify_rsp {
 	__le16 OutputBufferOffset;
 	__le32 OutputBufferLength;
 	__u8 Buffer[1];
+} __packed;
+
+struct smb2_file_notify_info {
+	__le32 NextEntryOffset;
+	__le32 Action;
+	__le32 FileNameLength;
+	__u8 FileName[0];
 } __packed;
 
 /* SMB2 Notify Action Flags */
